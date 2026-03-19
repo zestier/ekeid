@@ -1,2 +1,2 @@
 # ekeid
-Local cache for remapping between external ids
+Local cache for remapping between external ids on Wikidata
