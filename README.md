@@ -1,5 +1,7 @@
 # ekeid
 
+*Pronounced "eek-id" — from the archaic "ekename" (an additional name), the word that eventually became "nickname".*
+
 A self-hosted service that builds and maintains a local cache of external identifier mappings from [Wikidata](https://www.wikidata.org/). Look up any entity by one external ID (IMDb, TMDB, MusicBrainz, etc.) and get back its Wikidata QID along with all other known external IDs for that entity.
 
 ## Why
