@@ -146,11 +146,6 @@ go test ./...
 
 4. **Serving** — The API server opens the same database in read-only mode and serves lookup queries. Responses are cached for 1 hour (`Cache-Control: public, max-age=3600`). Per-IP rate limiting uses a token bucket algorithm.
 
-## Technology
-
-- **Go** — Standard library HTTP server and SSE client, no web framework
-- **SQLite** (via [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)) — Pure-Go SQLite driver, no CGO required
-
 ## License
 
 This project is released into the public domain under [CC0 1.0 Universal](LICENSE).
