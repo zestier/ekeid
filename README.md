@@ -8,6 +8,8 @@ A self-hosted service that builds and maintains a local cache of external identi
 
 Wikidata stores millions of cross-references between external identifiers — for example, a single movie entity might link its IMDb ID, TMDB ID, Rotten Tomatoes slug, and dozens more. Querying these mappings live via the Wikidata API or SPARQL endpoint can be slow and rate-limited. ekeid solves this by maintaining a local SQLite database that is seeded from a full Wikidata dump and kept up to date in real time via the Wikimedia EventStreams API.
 
+If requested I would probably be willing to host a public instance, but keep in mind that it is unlikely that its performance would exceed directly using a SPARQL query to Wikidata. Where this project is most useful is adding it to a stack that wants to do this kind of remapping quickly and without risking excessive unpredictable spikes in SPARQL queries likely to get you throttled, such as the backend for an application that uses this kind of remapping to satisfy user interactions that desire being as responsive as possible.
+
 ## Architecture
 
 ekeid consists of two services:
