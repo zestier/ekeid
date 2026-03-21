@@ -109,21 +109,17 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 	url := w.streamURL
 
 	// sinceTime is used for the gap check: did the stream return data
-	// going back far enough? Needed for both ?since= (timestamp) and
-	// Last-Event-ID (Kafka offset) reconnection — if the offset expired
-	// the server silently starts from the earliest available data.
+	// going back far enough? We always use ?since= (timestamp) rather
+	// than Last-Event-ID (Kafka offset) because it seems like there can
+	// be gaps if the last event ID is old.
 	var sinceTime time.Time
 
-	// Always read last_event_id from the DB so that reconnects follow the
-	// same code path as full process restarts.
 	lastEventID, err := w.writer.GetSyncState("last_event_id")
 	if err != nil {
 		return fmt.Errorf("get last_event_id: %w", err)
 	}
 
 	if lastEventID != "" {
-		// The event ID is a JSON array of Kafka offsets, each containing a
-		// millisecond timestamp. Extract the min for gap detection.
 		sinceTime = extractEventIDTime(lastEventID)
 	} else {
 		dumpTime, err := w.writer.GetSyncState("dump_time")
@@ -138,6 +134,9 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 			return fmt.Errorf("parse dump_time: %w", err)
 		}
 		sinceTime = t.Add(-dumpSafetyOffset)
+	}
+
+	if !sinceTime.IsZero() {
 		since := sinceTime.UTC().Format(time.RFC3339)
 		url = fmt.Sprintf("%s?since=%s", url, since)
 	}
@@ -147,9 +146,6 @@ func (w *EventStreamWatcher) connectAndProcess(ctx context.Context) error {
 		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
-	if lastEventID != "" {
-		req.Header.Set("Last-Event-ID", lastEventID)
-	}
 
 	resp, err := w.httpClient.Do(req)
 	if err != nil {
@@ -467,17 +463,4 @@ func (w *EventStreamWatcher) retryFailedEntities(ctx context.Context) {
 			}
 		}
 	}
-}
-
-// extractQIDFromError extracts a Q-number from an error of the form "process Q12345: ...".
-func extractQIDFromError(err error) string {
-	msg := err.Error()
-	if !strings.HasPrefix(msg, "process Q") {
-		return ""
-	}
-	qid := strings.TrimPrefix(msg, "process ")
-	if idx := strings.Index(qid, ":"); idx > 0 {
-		qid = qid[:idx]
-	}
-	return qid
 }
