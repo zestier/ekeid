@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,7 +31,7 @@ func main() {
 	rateLimit := 10.0
 	if v := os.Getenv("RATE_LIMIT"); v != "" {
 		parsed, err := strconv.ParseFloat(v, 64)
-		if err != nil || parsed < 0 {
+		if err != nil || math.IsNaN(parsed) || parsed < 0 {
 			log.Fatalf("Invalid RATE_LIMIT %q: must be a non-negative number", v)
 		}
 		rateLimit = parsed
@@ -52,7 +53,7 @@ func main() {
 	defer reader.Close()
 
 	var rateLimiter *api.RateLimiter
-	if rateLimit > 0 {
+	if rateLimit > 0 && !math.IsInf(rateLimit, 0) {
 		rateLimiter = api.NewRateLimiter(rateLimit, rateBurst)
 		defer rateLimiter.Stop()
 	}

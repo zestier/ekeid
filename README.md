@@ -97,7 +97,7 @@ Configuration is done through environment variables:
 | `DB_PATH` | Both | `/data/ekeid.db` | Path to the SQLite database file |
 | `DUMP_FORMAT` | Watcher | `gz` | Dump compression format: `gz` (~150 GB) or `bz2` (~100 GB) |
 | `LISTEN_ADDR` | API | `:8080` | Address for the API server to listen on |
-| `RATE_LIMIT` | API | `10` | Token bucket refill rate (requests per second per IP) |
+| `RATE_LIMIT` | API | `10` | Token bucket refill rate (requests per second per IP); set to `0` or `Inf` to disable |
 | `RATE_BURST` | API | `20` | Token bucket capacity (max burst per IP) |
 
 ### Running
