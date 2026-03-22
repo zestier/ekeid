@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -277,14 +278,18 @@ func (s *Seeder) NeedsSeed() (bool, error) {
 // Seed performs a bulk import by streaming the Wikidata JSON dump.
 // It respects ctx cancellation so the process can shut down promptly.
 func (s *Seeder) Seed(ctx context.Context) error {
-	if err := s.writer.ClearSyncCursors(); err != nil {
-		return err
-	}
-	if err := s.writer.SetSyncState("state", "seeding"); err != nil {
-		return fmt.Errorf("set state: %w", err)
-	}
-	if err := s.writer.SetSyncState("config_hash", configFingerprint()); err != nil {
-		return fmt.Errorf("set config hash: %w", err)
+	// Check for resumable seed: if a previous seed was interrupted we can
+	// skip already-processed lines when the ETag still matches.
+	var skipLines int
+	prevState, _ := s.writer.GetSyncState("state")
+	if prevState == "seeding" {
+		storedEtag, _ := s.writer.GetSyncState("seed_etag")
+		lineStr, _ := s.writer.GetSyncState("seed_line")
+		if storedEtag != "" && lineStr != "" {
+			if n, err := strconv.Atoi(lineStr); err == nil && n > 0 {
+				skipLines = n
+			}
+		}
 	}
 
 	log.Printf("Starting seed from Wikidata dump: %s", s.dumpURL)
@@ -296,6 +301,39 @@ func (s *Seeder) Seed(ctx context.Context) error {
 		return err
 	}
 	defer resp.Body.Close()
+
+	etag := resp.Header.Get("ETag")
+
+	// Decide whether to resume or restart.
+	if skipLines > 0 && etag != "" {
+		storedEtag, _ := s.writer.GetSyncState("seed_etag")
+		if etag == storedEtag {
+			log.Printf("Resuming seed from line %d (ETag matches: %s)", skipLines, etag)
+		} else {
+			log.Printf("Cannot resume seed: ETag mismatch (stored=%s, current=%s), restarting", storedEtag, etag)
+			skipLines = 0
+		}
+	} else {
+		skipLines = 0
+	}
+
+	if skipLines == 0 {
+		if err := s.writer.ClearSyncCursors(); err != nil {
+			return err
+		}
+		if err := s.writer.SetSyncState("config_hash", configFingerprint()); err != nil {
+			return fmt.Errorf("set config hash: %w", err)
+		}
+	}
+
+	if err := s.writer.SetSyncState("state", "seeding"); err != nil {
+		return fmt.Errorf("set state: %w", err)
+	}
+	if etag != "" {
+		if err := s.writer.SetSyncState("seed_etag", etag); err != nil {
+			return fmt.Errorf("set seed_etag: %w", err)
+		}
+	}
 
 	syncTime := parseDumpTime(resp.Header.Get("Last-Modified"))
 	log.Printf("Dump Last-Modified: %s → dump_time: %s",
@@ -361,7 +399,7 @@ func (s *Seeder) Seed(ctx context.Context) error {
 	}()
 
 	decompReader := &chanReader{ch: chunks, errCh: errCh, pool: chunkPool}
-	imported, lines, err := s.processDumpStream(ctx, decompReader, resp.ContentLength, counter, dumpTimeT)
+	imported, lines, err := s.processDumpStream(ctx, decompReader, resp.ContentLength, counter, dumpTimeT, skipLines)
 	if err != nil {
 		return err
 	}
@@ -423,10 +461,17 @@ func (s *Seeder) openDumpStream(ctx context.Context) (*http.Response, error) {
 	return resp, nil
 }
 
+// seedItem wraps an entity record with its source line number for seed
+// recovery tracking. This keeps line tracking out of the store layer.
+type seedItem struct {
+	store.EntityRecord
+	line int
+}
+
 // processDumpStream reads decompressed JSON lines from r and upserts
 // relevant entities. It uses a background goroutine to write to the DB
 // while parsing continues, overlapping I/O with CPU work.
-func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompressed int64, counter *countingReader, dumpTime time.Time) (int, int, error) {
+func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompressed int64, counter *countingReader, dumpTime time.Time, skipLines int) (int, int, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, dumpScannerBufSize), dumpScannerBufSize)
 
@@ -434,8 +479,12 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 	started := time.Now()
 	lastLog := started
 
+	if skipLines > 0 {
+		log.Printf("Skipping %d already-processed lines...", skipLines)
+	}
+
 	// Channel for sending entities to background writer
-	entityCh := make(chan store.EntityRecord, 10000)
+	entityCh := make(chan seedItem, 10000)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -445,6 +494,7 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 		defer wg.Done()
 
 		batch := make([]store.EntityRecord, 0, dumpBatchSize)
+		maxLine := 0
 		flush := func() error {
 			if len(batch) == 0 {
 				return nil
@@ -452,12 +502,20 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 			if err := s.writer.SeedEntitiesBatch(dumpTime, batch); err != nil {
 				return err
 			}
+			// Persist the max line number in this batch for seed recovery.
+			if maxLine > 0 {
+				if err := s.writer.SetSyncState("seed_line", strconv.Itoa(maxLine)); err != nil {
+					return err
+				}
+			}
 			batch = batch[:0]
+			maxLine = 0
 			return nil
 		}
 
-		for entity := range entityCh {
-			batch = append(batch, entity)
+		for item := range entityCh {
+			batch = append(batch, item.EntityRecord)
+			maxLine = max(maxLine, item.line)
 			if len(batch) >= dumpBatchSize {
 				if err := flush(); err != nil {
 					log.Printf("Error in background writer: %v", err)
@@ -485,6 +543,17 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 		line := scanner.Bytes()
 		lines++
 
+		// Skip lines already processed in a previous run.
+		if lines <= skipLines {
+			if now := time.Now(); now.Sub(lastLog) >= dumpProgressInterval {
+				rate := float64(lines) / now.Sub(started).Seconds()
+				log.Printf("  skip progress: %d/%d lines skipped (%.0f lines/sec)",
+					lines, skipLines, rate)
+				lastLog = now
+			}
+			continue
+		}
+
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 || line[0] == '[' || line[0] == ']' {
 			continue
@@ -504,10 +573,13 @@ func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompre
 			continue
 		}
 
-		entityCh <- store.EntityRecord{
-			WikidataID:  entity.ID,
-			ExternalIDs: entity.ExternalIDs,
-			Modified:    entity.Modified,
+		entityCh <- seedItem{
+			EntityRecord: store.EntityRecord{
+				WikidataID:  entity.ID,
+				ExternalIDs: entity.ExternalIDs,
+				Modified:    entity.Modified,
+			},
+			line: lines,
 		}
 		imported++
 

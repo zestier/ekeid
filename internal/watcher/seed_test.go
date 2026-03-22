@@ -258,7 +258,7 @@ func TestProcessDumpStream_ViewedAtMaxDumpTime(t *testing.T) {
 	dumpData.WriteString("\n]\n")
 
 	seeder := NewSeeder(writer, nil, DumpFormatGZ)
-	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime)
+	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime, 0)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestProcessDumpStream_ViewedAtEntityModified(t *testing.T) {
 	dumpData.WriteString("\n]\n")
 
 	seeder := NewSeeder(writer, nil, DumpFormatGZ)
-	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime)
+	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime, 0)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
@@ -355,7 +355,7 @@ func TestProcessDumpStream_EventStreamEntitySurvivesSweep(t *testing.T) {
 	dumpData.WriteString("\n]\n")
 
 	seeder := NewSeeder(writer, nil, DumpFormatGZ)
-	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime)
+	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime, 0)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestProcessDumpStream(t *testing.T) {
 
 	seeder := NewSeeder(writer, nil, DumpFormatGZ)
 	dumpTime := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
-	imported, lines, err := seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime)
+	imported, lines, err := seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime, 0)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
@@ -564,7 +564,7 @@ func TestProcessDumpStreamBZ2(t *testing.T) {
 
 	seeder := NewSeeder(writer, nil, DumpFormatBZ2)
 	dumpTime := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
-	imported, _, err := seeder.processDumpStream(context.Background(), decompressed, 0, nil, dumpTime)
+	imported, _, err := seeder.processDumpStream(context.Background(), decompressed, 0, nil, dumpTime, 0)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
@@ -605,7 +605,7 @@ func TestProcessDumpStreamGZ(t *testing.T) {
 
 	seeder := NewSeeder(writer, nil, DumpFormatGZ)
 	dumpTime := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
-	imported, _, err := seeder.processDumpStream(context.Background(), reader, 0, nil, dumpTime)
+	imported, _, err := seeder.processDumpStream(context.Background(), reader, 0, nil, dumpTime, 0)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
