@@ -349,6 +349,7 @@ func (s *Seeder) Seed() error {
 		return err
 	}
 
+	log.Printf("Sweeping stale mapping rows not present in dump...")
 	swept, err := s.writer.SweepUnseenEntities()
 	if err != nil {
 		return fmt.Errorf("sweep stale entities: %w", err)
