@@ -14,11 +14,13 @@ type HealthInfo struct {
 	DumpTime      time.Time
 	LastEventSync time.Time
 	State         string
+	SchemaMatch   bool
 }
 
 // DBStats holds database statistics (expensive COUNT queries).
 type DBStats struct {
 	MappingCount  int64
+	EntityCount   int64
 	PendingCount  int64
 	FailedCount   int64
 	DatabaseSize  int64

@@ -34,6 +34,10 @@ func main() {
 	}
 	defer writer.Close()
 
+	if err := writer.MigrateSchema(); err != nil {
+		log.Fatalf("Failed to migrate schema: %v", err)
+	}
+
 	httpClient := &http.Client{Timeout: 5 * time.Minute, Transport: transport}
 	wikidataClient := watcher.NewWikidataClient(httpClient)
 
@@ -55,7 +59,10 @@ func main() {
 
 		if needsSeed {
 			log.Println("Database needs seeding...")
-			if err := seeder.Seed(); err != nil {
+			if err := seeder.Seed(ctx); err != nil {
+				if ctx.Err() != nil {
+					break
+				}
 				log.Fatalf("Seed failed: %v", err)
 			}
 		} else {

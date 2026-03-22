@@ -31,6 +31,7 @@ func (e *RateLimitedError) Error() string {
 type WikidataEntity struct {
 	ID          string
 	ExternalIDs map[int][]string // Wikidata property number → values
+	Modified    time.Time        // entity's last-modified time
 }
 
 // WikidataClient fetches entity data from Wikidata.
@@ -79,7 +80,7 @@ func (c *WikidataClient) FetchEntitiesRaw(qids []string) (map[string]EntityResul
 		return nil, fmt.Errorf("wbgetentities: batch size %d exceeds limit of 50", len(qids))
 	}
 
-	apiURL := fmt.Sprintf("%s/w/api.php?action=wbgetentities&format=json&maxlag=%d&props=claims&ids=%s",
+	apiURL := fmt.Sprintf("%s/w/api.php?action=wbgetentities&format=json&maxlag=%d&props=claims%%7Cinfo&ids=%s",
 		c.baseURL, wikimediaMaxlag, strings.Join(qids, "%7C"))
 
 	req, err := newRequest("GET", apiURL)
@@ -205,7 +206,8 @@ func (c *WikidataClient) FetchEntity(qid string) (*WikidataEntity, error) {
 func ParseEntityJSON(qid string, data []byte) (*WikidataEntity, error) {
 	var raw struct {
 		Entities map[string]struct {
-			Claims claimsMap `json:"claims"`
+			Claims   claimsMap `json:"claims"`
+			Modified string    `json:"modified"`
 		} `json:"entities"`
 	}
 
@@ -223,9 +225,15 @@ func ParseEntityJSON(qid string, data []byte) (*WikidataEntity, error) {
 		return nil, nil
 	}
 
+	var modified time.Time
+	if entityData.Modified != "" {
+		modified, _ = time.Parse(time.RFC3339, entityData.Modified)
+	}
+
 	return &WikidataEntity{
 		ID:          qid,
 		ExternalIDs: externalIDs,
+		Modified:    modified,
 	}, nil
 }
 
@@ -234,9 +242,10 @@ func ParseEntityJSON(qid string, data []byte) (*WikidataEntity, error) {
 // Returns nil if the entity has no external IDs.
 func parseDumpEntity(data []byte) (*WikidataEntity, error) {
 	var raw struct {
-		ID     string    `json:"id"`
-		Type   string    `json:"type"`
-		Claims claimsMap `json:"claims"`
+		ID       string    `json:"id"`
+		Type     string    `json:"type"`
+		Claims   claimsMap `json:"claims"`
+		Modified string    `json:"modified"`
 	}
 
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -253,9 +262,15 @@ func parseDumpEntity(data []byte) (*WikidataEntity, error) {
 		return nil, nil
 	}
 
+	var modified time.Time
+	if raw.Modified != "" {
+		modified, _ = time.Parse(time.RFC3339, raw.Modified)
+	}
+
 	return &WikidataEntity{
 		ID:          raw.ID,
 		ExternalIDs: externalIDs,
+		Modified:    modified,
 	}, nil
 }
 

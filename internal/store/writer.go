@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
@@ -11,8 +12,7 @@ import (
 
 // Writer provides read-write access to the database (used by the watcher).
 type Writer struct {
-	db           *sql.DB
-	seedTracking bool
+	db *sql.DB
 }
 
 // NewWriter opens a SQLite database in read-write mode and initializes the schema.
@@ -57,10 +57,15 @@ func configureSQLite(db *sql.DB) error {
 
 func createSchema(db *sql.DB) error {
 	schema := `
+	CREATE TABLE IF NOT EXISTS entity (
+		wikidata_id INTEGER PRIMARY KEY,
+		viewed_at   INTEGER NOT NULL
+	);
+
 	CREATE TABLE IF NOT EXISTS mapping (
 		property    INTEGER NOT NULL,
 		value       TEXT NOT NULL,
-		wikidata_id INTEGER NOT NULL,
+		wikidata_id INTEGER NOT NULL REFERENCES entity(wikidata_id) ON DELETE CASCADE,
 		PRIMARY KEY (property, value)
 	);
 
@@ -89,10 +94,57 @@ func createSchema(db *sql.DB) error {
 	return nil
 }
 
+// MigrateSchema checks the stored schema version and drops all tables if it
+// does not match the current SchemaVersion(). This ensures the database
+// structure is always consistent with the running code. After dropping,
+// tables are recreated and the new version is stored.
+func (w *Writer) MigrateSchema() error {
+	expected := SchemaVersion()
+
+	// Try to read the stored version. If sync_state doesn't exist yet
+	// (brand-new DB) the query will fail — treat that as a mismatch.
+	var stored string
+	err := w.db.QueryRow(`SELECT value FROM sync_state WHERE key = 'schema_version'`).Scan(&stored)
+	log.Printf("Expected schema version: %s, found schema version: %s", expected, stored)
+	if err == nil && stored == expected {
+		return nil // schema is current
+	}
+
+	// Drop all user tables and recreate. Query sqlite_master so we never
+	// leave orphaned tables from a previous schema version.
+	rows, err := w.db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		return fmt.Errorf("list tables: %w", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan table name: %w", err)
+		}
+		tables = append(tables, name)
+	}
+	rows.Close()
+	for _, t := range tables {
+		log.Printf("Schema migration: dropping table %s", t)
+		if _, err := w.db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t)); err != nil {
+			return fmt.Errorf("drop table %s: %w", t, err)
+		}
+	}
+
+	if err := createSchema(w.db); err != nil {
+		return err
+	}
+
+	return w.SetSyncState("schema_version", expected)
+}
+
 // EntityRecord holds the data for a single entity upsert within a batch.
 type EntityRecord struct {
 	WikidataID  string
 	ExternalIDs map[int][]string // property ID → values
+	Modified    time.Time        // entity's last-modified time (used as viewed_at)
 }
 
 // UpsertEntity inserts or updates an entity and its mappings atomically.
@@ -106,6 +158,8 @@ func (w *Writer) UpsertEntity(wikidataID string, externalIDs map[int][]string) e
 // UpsertEntitiesBatch inserts or updates multiple entities in a single transaction.
 // This amortises transaction overhead across the entire batch, which is
 // dramatically faster than individual UpsertEntity calls during bulk imports.
+// Each record's Modified time is used as viewed_at. The stored viewed_at is
+// never decreased (SQL max ensures monotonicity).
 func (w *Writer) UpsertEntitiesBatch(records []EntityRecord) error {
 	if len(records) == 0 {
 		return nil
@@ -116,6 +170,16 @@ func (w *Writer) UpsertEntitiesBatch(records []EntityRecord) error {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+
+	entityStmt, err := tx.Prepare(`
+		INSERT INTO entity (wikidata_id, viewed_at) VALUES (?, ?)
+		ON CONFLICT(wikidata_id) DO UPDATE SET
+			viewed_at = max(excluded.viewed_at, entity.viewed_at)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare entity upsert: %w", err)
+	}
+	defer entityStmt.Close()
 
 	deleteStmt, err := tx.Prepare(`DELETE FROM mapping WHERE wikidata_id = ?`)
 	if err != nil {
@@ -134,24 +198,17 @@ func (w *Writer) UpsertEntitiesBatch(records []EntityRecord) error {
 	}
 	defer idStmt.Close()
 
-	var seedStmt *sql.Stmt
-	if w.seedTracking {
-		seedStmt, err = tx.Prepare(`INSERT OR IGNORE INTO _seed_seen (wikidata_id) VALUES (?)`)
-		if err != nil {
-			return fmt.Errorf("prepare seed tracking: %w", err)
-		}
-		defer seedStmt.Close()
-	}
-
 	for _, rec := range records {
 		id, err := qidToInt(rec.WikidataID)
 		if err != nil {
 			return fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
 		}
-		if seedStmt != nil {
-			if _, err := seedStmt.Exec(id); err != nil {
-				return fmt.Errorf("track seed entity %s: %w", rec.WikidataID, err)
-			}
+		viewedAt := rec.Modified.Unix()
+		if viewedAt <= 0 {
+			viewedAt = time.Now().Unix()
+		}
+		if _, err := entityStmt.Exec(id, viewedAt); err != nil {
+			return fmt.Errorf("upsert entity %s: %w", rec.WikidataID, err)
 		}
 		if _, err := deleteStmt.Exec(id); err != nil {
 			return fmt.Errorf("delete old mappings for %s: %w", rec.WikidataID, err)
@@ -168,13 +225,110 @@ func (w *Writer) UpsertEntitiesBatch(records []EntityRecord) error {
 	return tx.Commit()
 }
 
+// SeedEntitiesBatch inserts or updates multiple entities during a seed import.
+// Unlike UpsertEntitiesBatch, it uses dumpTime (not the entity's Modified time)
+// for viewed_at, and only writes mappings when the entity is new or when the
+// entity's Modified time is newer than the existing viewed_at. This avoids
+// overwriting fresher data that was written by the event stream between seeds.
+func (w *Writer) SeedEntitiesBatch(dumpTime time.Time, records []EntityRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	tx, err := w.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	queryStmt, err := tx.Prepare(`SELECT viewed_at FROM entity WHERE wikidata_id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare viewed_at query: %w", err)
+	}
+	defer queryStmt.Close()
+
+	entityStmt, err := tx.Prepare(`
+		INSERT INTO entity (wikidata_id, viewed_at) VALUES (?, ?)
+		ON CONFLICT(wikidata_id) DO UPDATE SET
+			viewed_at = max(excluded.viewed_at, entity.viewed_at)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare entity upsert: %w", err)
+	}
+	defer entityStmt.Close()
+
+	deleteStmt, err := tx.Prepare(`DELETE FROM mapping WHERE wikidata_id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare delete: %w", err)
+	}
+	defer deleteStmt.Close()
+
+	idStmt, err := tx.Prepare(`
+		INSERT INTO mapping (property, value, wikidata_id)
+		VALUES (?, ?, ?)
+		ON CONFLICT(property, value) DO UPDATE SET
+			wikidata_id = excluded.wikidata_id
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare mapping insert: %w", err)
+	}
+	defer idStmt.Close()
+
+	dumpUnix := dumpTime.Unix()
+
+	for _, rec := range records {
+		id, err := qidToInt(rec.WikidataID)
+		if err != nil {
+			return fmt.Errorf("convert QID %s: %w", rec.WikidataID, err)
+		}
+
+		// Check existing viewed_at to decide what needs updating.
+		var existingViewedAt int64
+		isNew := true
+		if err := queryStmt.QueryRow(id).Scan(&existingViewedAt); err == nil {
+			isNew = false
+		}
+
+		needMappings := isNew || rec.Modified.Unix() > existingViewedAt
+		needEntityUpsert := needMappings || dumpUnix > existingViewedAt
+
+		if !needEntityUpsert && !needMappings {
+			continue
+		}
+
+		// Set viewed_at = max(dumpTime, in-db viewed_at).
+		if needEntityUpsert {
+			if _, err := entityStmt.Exec(id, dumpUnix); err != nil {
+				return fmt.Errorf("upsert entity %s: %w", rec.WikidataID, err)
+			}
+		}
+
+		// Only write mappings if entity is new or its Modified time is
+		// newer than what was already stored.
+		if needMappings {
+			if _, err := deleteStmt.Exec(id); err != nil {
+				return fmt.Errorf("delete old mappings for %s: %w", rec.WikidataID, err)
+			}
+			for property, values := range rec.ExternalIDs {
+				for _, val := range values {
+					if _, err := idStmt.Exec(property, val, id); err != nil {
+						return fmt.Errorf("insert mapping (P%d, %s): %w", property, val, err)
+					}
+				}
+			}
+		}
+	}
+
+	return tx.Commit()
+}
+
 // DeleteEntity removes an entity and its mappings.
 func (w *Writer) DeleteEntity(wikidataID string) error {
 	return w.DeleteEntitiesBatch([]string{wikidataID})
 }
 
 // DeleteEntitiesBatch removes multiple entities and their mappings in a
-// single transaction.
+// single transaction. Mapping rows are removed via CASCADE.
 func (w *Writer) DeleteEntitiesBatch(qids []string) error {
 	if len(qids) == 0 {
 		return nil
@@ -185,7 +339,7 @@ func (w *Writer) DeleteEntitiesBatch(qids []string) error {
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`DELETE FROM mapping WHERE wikidata_id = ?`)
+	stmt, err := tx.Prepare(`DELETE FROM entity WHERE wikidata_id = ?`)
 	if err != nil {
 		return fmt.Errorf("prepare delete: %w", err)
 	}
@@ -203,28 +357,14 @@ func (w *Writer) DeleteEntitiesBatch(qids []string) error {
 	return tx.Commit()
 }
 
-// StartSeedTracking creates a temporary table to track which entities are
-// seen during a seed import. Call SweepUnseenEntities after the import to
-// delete stale entities that were not present in the dump.
-func (w *Writer) StartSeedTracking() error {
-	_, err := w.db.Exec(`CREATE TEMP TABLE IF NOT EXISTS _seed_seen (wikidata_id INTEGER PRIMARY KEY)`)
+// SweepStaleEntities deletes entities (and their mappings via CASCADE)
+// whose viewed_at is older than beforeUnix. Returns the number of entity
+// rows removed.
+func (w *Writer) SweepStaleEntities(beforeUnix int64) (int64, error) {
+	result, err := w.db.Exec(`DELETE FROM entity WHERE viewed_at < ?`, beforeUnix)
 	if err != nil {
-		return fmt.Errorf("create seed tracking table: %w", err)
+		return 0, fmt.Errorf("sweep stale entities: %w", err)
 	}
-	w.seedTracking = true
-	return nil
-}
-
-// SweepUnseenEntities deletes mappings for entities not seen during the
-// current seed import and tears down the tracking table. Returns the
-// number of mapping rows removed.
-func (w *Writer) SweepUnseenEntities() (int64, error) {
-	result, err := w.db.Exec(`DELETE FROM mapping WHERE wikidata_id NOT IN (SELECT wikidata_id FROM _seed_seen)`)
-	if err != nil {
-		return 0, fmt.Errorf("sweep unseen entities: %w", err)
-	}
-	w.db.Exec(`DROP TABLE IF EXISTS _seed_seen`)
-	w.seedTracking = false
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return 0, err

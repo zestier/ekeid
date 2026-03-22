@@ -82,6 +82,7 @@ func (p *Processor) ProcessEntities(qids []string) (map[string]error, error) {
 		upserts = append(upserts, store.EntityRecord{
 			WikidataID:  entity.ID,
 			ExternalIDs: entity.ExternalIDs,
+			Modified:    entity.Modified,
 		})
 	}
 

@@ -12,7 +12,8 @@ import (
 
 // Reader provides read-only access to the database (used by the API server).
 type Reader struct {
-	db *sql.DB
+	db       *sql.DB
+	schemaOK bool
 }
 
 // NewReader opens a SQLite database in read-only mode.
@@ -33,17 +34,28 @@ func NewReader(dbPath string) (*Reader, error) {
 		}
 	}
 
-	return &Reader{db: db}, nil
+	return &Reader{db: db, schemaOK: checkSchemaVersion(db)}, nil
 }
 
 // NewReaderFromDB creates a Reader wrapping an existing *sql.DB (for testing).
 func NewReaderFromDB(db *sql.DB) *Reader {
-	return &Reader{db: db}
+	return &Reader{db: db, schemaOK: checkSchemaVersion(db)}
+}
+
+// checkSchemaVersion returns true if the stored schema_version matches the
+// current SchemaVersion(). Returns false on any error (missing table, etc.).
+func checkSchemaVersion(db *sql.DB) bool {
+	var stored string
+	err := db.QueryRow(`SELECT value FROM sync_state WHERE key = 'schema_version'`).Scan(&stored)
+	return err == nil && stored == SchemaVersion()
 }
 
 // LookupByProperty finds the entity mapped to (property, value) and returns
 // all of that entity's mappings.
 func (r *Reader) LookupByProperty(property int, value string) (*model.LookupResult, error) {
+	if !r.schemaOK {
+		return nil, ErrSchemaMismatch
+	}
 	rows, err := r.db.Query(`
 		SELECT wikidata_id, property, value FROM mapping
 		WHERE wikidata_id = (
@@ -88,6 +100,7 @@ func (r *Reader) GetHealth() (*model.HealthInfo, error) {
 
 	info := &model.HealthInfo{
 		DatabaseSize: pageCount * pageSize,
+		SchemaMatch:  r.schemaOK,
 	}
 
 	dumpTime, eventTime, err := r.syncTimes()
@@ -145,6 +158,7 @@ func (r *Reader) GetStats() (*model.DBStats, error) {
 
 	r.db.QueryRow(`SELECT COUNT(*) FROM pending_entity`).Scan(&stats.PendingCount)
 	r.db.QueryRow(`SELECT COUNT(*) FROM failed_entity`).Scan(&stats.FailedCount)
+	r.db.QueryRow(`SELECT COUNT(*) FROM entity`).Scan(&stats.EntityCount)
 
 	return stats, nil
 }
@@ -208,6 +222,9 @@ func eventIDToTime(eventID string) time.Time {
 // LookupByWikidataID finds the entity by its Wikidata numeric ID and returns
 // all of its mappings.
 func (r *Reader) LookupByWikidataID(wikidataID int64) (*model.LookupResult, error) {
+	if !r.schemaOK {
+		return nil, ErrSchemaMismatch
+	}
 	rows, err := r.db.Query(`
 		SELECT property, value FROM mapping
 		WHERE wikidata_id = ?

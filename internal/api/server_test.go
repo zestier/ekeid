@@ -20,6 +20,9 @@ func setupTestServer(t *testing.T) (*Server, *store.Writer) {
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
+	if err := w.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
 	t.Cleanup(func() { w.Close() })
 
 	r := store.NewReaderFromDB(w.DB())
@@ -348,6 +351,28 @@ func TestHealthEmptyDB(t *testing.T) {
 	}
 }
 
+// TestHealthSchemaMatchTrue verifies that the health endpoint reports
+// schema_match=true when the schema is up to date.
+func TestHealthSchemaMatchTrue(t *testing.T) {
+	srv, _ := setupTestServer(t) // setupTestServer calls MigrateSchema
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var resp healthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.SchemaMatch {
+		t.Error("expected SchemaMatch=true for healthy server")
+	}
+}
+
 func TestLookupCaseInsensitiveProperty(t *testing.T) {
 	srv, w := setupTestServer(t)
 	w.UpsertEntity("Q172241", map[int][]string{345: {"tt0111161"}})
@@ -371,6 +396,9 @@ func setupRateLimitedServer(t *testing.T, rate float64, burst int) (*Server, *st
 	w, err := store.NewWriter(dbPath)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
 	}
 	t.Cleanup(func() { w.Close() })
 	r := store.NewReaderFromDB(w.DB())
@@ -650,4 +678,113 @@ func TestRateLimitStopIdempotent(t *testing.T) {
 	rl.Stop()
 	rl.Stop()
 	rl.Stop()
+}
+
+// --- Schema mismatch tests ---
+
+// setupMismatchedServer creates a server whose Reader detects a schema mismatch.
+func setupMismatchedServer(t *testing.T) *Server {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	w, err := store.NewWriter(dbPath)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+	w.UpsertEntity("Q1", map[int][]string{345: {"tt1"}})
+
+	// Corrupt the schema version so the Reader sees a mismatch
+	w.SetSyncState("schema_version", "wrong-version")
+	t.Cleanup(func() { w.Close() })
+
+	r := store.NewReaderFromDB(w.DB())
+	return NewServer(r, "0.1.0-test", nil)
+}
+
+// TestLookupSchemaMismatch503 verifies that /v1/lookup/P…/… returns 503
+// when the schema version doesn't match.
+func TestLookupSchemaMismatch503(t *testing.T) {
+	srv := setupMismatchedServer(t)
+
+	req := httptest.NewRequest("GET", "/v1/lookup/P345/tt1", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d (503). body: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+
+	var resp errorResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Error != "unavailable" {
+		t.Errorf("Error = %q, want %q", resp.Error, "unavailable")
+	}
+}
+
+// TestWikidataLookupSchemaMismatch503 verifies that /v1/lookup/Q… returns 503
+// when the schema version doesn't match.
+func TestWikidataLookupSchemaMismatch503(t *testing.T) {
+	srv := setupMismatchedServer(t)
+
+	req := httptest.NewRequest("GET", "/v1/lookup/Q1", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d (503). body: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+}
+
+// TestHealthSchemaMismatch verifies health endpoint reports schema_match=false.
+func TestHealthSchemaMismatch(t *testing.T) {
+	srv := setupMismatchedServer(t)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var resp healthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.SchemaMatch {
+		t.Error("expected SchemaMatch=false with corrupted schema version")
+	}
+}
+
+// TestStatsEntityCount verifies /v1/stats includes entity_count.
+func TestStatsEntityCount(t *testing.T) {
+	srv, w := setupTestServer(t)
+
+	w.UpsertEntity("Q1", map[int][]string{345: {"tt1"}})
+	w.UpsertEntity("Q2", map[int][]string{345: {"tt2"}, 4947: {"100"}})
+
+	req := httptest.NewRequest("GET", "/v1/stats", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var resp statsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.EntityCount != 2 {
+		t.Errorf("EntityCount = %d, want 2", resp.EntityCount)
+	}
+	if resp.MappingCount != 3 {
+		t.Errorf("MappingCount = %d, want 3", resp.MappingCount)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -51,7 +52,8 @@ func buildDumpEntityJSON(qid, label string, properties map[string]string) []byte
 				"value":    label,
 			},
 		},
-		"claims": claims,
+		"claims":   claims,
+		"modified": "2026-03-09T00:00:00Z",
 	}
 
 	data, _ := json.Marshal(entity)
@@ -149,6 +151,294 @@ func TestParseDumpEntity_InvalidJSON(t *testing.T) {
 	}
 }
 
+// TestParseDumpEntity_ExtractsModified verifies the modified field is parsed.
+func TestParseDumpEntity_ExtractsModified(t *testing.T) {
+	data := buildDumpEntityJSON("Q1", "Test", map[string]string{"P345": "tt1"})
+	entity, err := parseDumpEntity(data)
+	if err != nil {
+		t.Fatalf("parseDumpEntity: %v", err)
+	}
+	if entity == nil {
+		t.Fatal("expected non-nil entity")
+	}
+	expected := time.Date(2026, 3, 9, 0, 0, 0, 0, time.UTC)
+	if !entity.Modified.Equal(expected) {
+		t.Errorf("Modified = %v, want %v", entity.Modified, expected)
+	}
+}
+
+// TestParseDumpEntity_MissingModified verifies zero time when modified is absent.
+func TestParseDumpEntity_MissingModified(t *testing.T) {
+	entity := map[string]interface{}{
+		"type": "item",
+		"id":   "Q1",
+		"claims": map[string]interface{}{
+			"P345": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"snaktype": "value",
+						"property": "P345",
+						"datatype": "external-id",
+						"datavalue": map[string]interface{}{
+							"value": "tt1",
+							"type":  "string",
+						},
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(entity)
+
+	result, err := parseDumpEntity(data)
+	if err != nil {
+		t.Fatalf("parseDumpEntity: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil entity")
+	}
+	if !result.Modified.IsZero() {
+		t.Errorf("Modified = %v, want zero time", result.Modified)
+	}
+}
+
+// buildDumpEntityJSONWithModified constructs a dump-format entity JSON with
+// a custom modified timestamp.
+func buildDumpEntityJSONWithModified(qid string, properties map[string]string, modified string) []byte {
+	claims := make(map[string]interface{})
+	for propID, value := range properties {
+		claims[propID] = []map[string]interface{}{
+			{
+				"mainsnak": map[string]interface{}{
+					"snaktype": "value",
+					"property": propID,
+					"datatype": "external-id",
+					"datavalue": map[string]interface{}{
+						"value": value,
+						"type":  "string",
+					},
+				},
+			},
+		}
+	}
+
+	entity := map[string]interface{}{
+		"type":     "item",
+		"id":       qid,
+		"claims":   claims,
+		"modified": modified,
+	}
+
+	data, _ := json.Marshal(entity)
+	return data
+}
+
+// TestProcessDumpStream_ViewedAtMaxDumpTime verifies that when an entity's
+// Modified is older than dumpTime, viewed_at is set to dumpTime.
+func TestProcessDumpStream_ViewedAtMaxDumpTime(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	writer, err := store.NewWriter(dbPath)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
+	dumpTime := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	// Entity modified in 2025, older than dumpTime
+	entity := buildDumpEntityJSONWithModified("Q1", map[string]string{"P345": "tt1"}, "2025-01-01T00:00:00Z")
+
+	var dumpData bytes.Buffer
+	dumpData.WriteString("[\n")
+	dumpData.Write(entity)
+	dumpData.WriteString("\n]\n")
+
+	seeder := NewSeeder(writer, nil, DumpFormatGZ)
+	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime)
+	if err != nil {
+		t.Fatalf("processDumpStream: %v", err)
+	}
+
+	// Sweep at dumpTime should NOT remove this entity because
+	// viewed_at was set to dumpTime (which is >= dumpTime)
+	swept, err := writer.SweepStaleEntities(dumpTime.Unix())
+	if err != nil {
+		t.Fatalf("SweepStaleEntities: %v", err)
+	}
+	if swept != 0 {
+		t.Errorf("swept = %d, want 0 (viewed_at should be dumpTime)", swept)
+	}
+}
+
+// TestProcessDumpStream_ViewedAtEntityModified verifies that when an entity's
+// Modified is newer than dumpTime, viewed_at is set to entity.Modified.
+func TestProcessDumpStream_ViewedAtEntityModified(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	writer, err := store.NewWriter(dbPath)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
+	dumpTime := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	entityModified := "2026-06-01T00:00:00Z"
+	entityModifiedTime, _ := time.Parse(time.RFC3339, entityModified)
+	entity := buildDumpEntityJSONWithModified("Q1", map[string]string{"P345": "tt1"}, entityModified)
+
+	var dumpData bytes.Buffer
+	dumpData.WriteString("[\n")
+	dumpData.Write(entity)
+	dumpData.WriteString("\n]\n")
+
+	seeder := NewSeeder(writer, nil, DumpFormatGZ)
+	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime)
+	if err != nil {
+		t.Fatalf("processDumpStream: %v", err)
+	}
+
+	// Sweep at a time between dumpTime and entityModifiedTime should
+	// NOT sweep the entity because viewed_at = entity.Modified (newer)
+	midTime := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	swept, err := writer.SweepStaleEntities(midTime.Unix())
+	if err != nil {
+		t.Fatalf("SweepStaleEntities: %v", err)
+	}
+	if swept != 0 {
+		t.Errorf("swept = %d, want 0 (viewed_at should be entity.Modified=%v)", swept, entityModifiedTime)
+	}
+}
+
+// TestProcessDumpStream_EventStreamEntitySurvivesSweep tests the key scenario:
+// an entity updated via event stream with a newer Modified time should NOT be
+// swept by a subsequent dump seed.
+func TestProcessDumpStream_EventStreamEntitySurvivesSweep(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	writer, err := store.NewWriter(dbPath)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
+	dumpTime := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	eventStreamTime := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC) // much newer
+
+	// Pre-populate an entity as if it arrived via event stream
+	err = writer.UpsertEntitiesBatch([]store.EntityRecord{{
+		WikidataID:  "Q999",
+		ExternalIDs: map[int][]string{345: {"tt999"}},
+		Modified:    eventStreamTime,
+	}})
+	if err != nil {
+		t.Fatalf("event stream upsert: %v", err)
+	}
+
+	// Q999 is NOT in the dump (simulating entity not in dump)
+	entity1 := buildDumpEntityJSONWithModified("Q1", map[string]string{"P345": "tt1"}, "2026-01-01T00:00:00Z")
+
+	var dumpData bytes.Buffer
+	dumpData.WriteString("[\n")
+	dumpData.Write(entity1)
+	dumpData.WriteString("\n]\n")
+
+	seeder := NewSeeder(writer, nil, DumpFormatGZ)
+	_, _, err = seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime)
+	if err != nil {
+		t.Fatalf("processDumpStream: %v", err)
+	}
+
+	// Sweep at dumpTime — Q999 should survive because its viewed_at (eventStreamTime)
+	// is newer than dumpTime
+	swept, err := writer.SweepStaleEntities(dumpTime.Unix())
+	if err != nil {
+		t.Fatalf("SweepStaleEntities: %v", err)
+	}
+	if swept != 0 {
+		t.Error("expected event-stream entity to survive dump sweep")
+	}
+
+	reader := store.NewReaderFromDB(writer.DB())
+	result, err := reader.LookupByProperty(345, "tt999")
+	if err != nil {
+		t.Fatalf("LookupByProperty: %v", err)
+	}
+	if result == nil {
+		t.Error("event-stream entity should still exist after dump sweep")
+	}
+}
+
+// TestConfigFingerprintDeterministic verifies configFingerprint is stable.
+func TestConfigFingerprintDeterministic(t *testing.T) {
+	h1 := configFingerprint()
+	h2 := configFingerprint()
+	if h1 != h2 {
+		t.Errorf("configFingerprint not deterministic: %q != %q", h1, h2)
+	}
+	if len(h1) == 0 {
+		t.Error("configFingerprint returned empty string")
+	}
+}
+
+// TestConfigFingerprintDiffersFromSchemaVersion verifies that config_hash and
+// schema_version are independent (different strings).
+func TestConfigFingerprintDiffersFromSchemaVersion(t *testing.T) {
+	cfgHash := configFingerprint()
+	schemaVersion := store.SchemaVersion()
+	if cfgHash == schemaVersion {
+		t.Errorf("configFingerprint = SchemaVersion = %q; they should be independent", cfgHash)
+	}
+}
+
+// TestParseDumpEntity_UnparseableModified verifies that an invalid modified
+// date is silently treated as zero time, not an error.
+func TestParseDumpEntity_UnparseableModified(t *testing.T) {
+	entity := map[string]interface{}{
+		"type": "item",
+		"id":   "Q1",
+		"claims": map[string]interface{}{
+			"P345": []map[string]interface{}{
+				{
+					"mainsnak": map[string]interface{}{
+						"snaktype": "value",
+						"property": "P345",
+						"datatype": "external-id",
+						"datavalue": map[string]interface{}{
+							"value": "tt1",
+							"type":  "string",
+						},
+					},
+				},
+			},
+		},
+		"modified": "not-a-real-date",
+	}
+	data, _ := json.Marshal(entity)
+
+	result, err := parseDumpEntity(data)
+	if err != nil {
+		t.Fatalf("parseDumpEntity should not error on bad modified: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil entity")
+	}
+	if !result.Modified.IsZero() {
+		t.Errorf("Modified = %v, want zero time for unparseable date", result.Modified)
+	}
+}
+
 func compressBZ2(t *testing.T, data []byte) []byte {
 	// bzip2 package in stdlib is decompress-only, so we use the gzip format
 	// for tests that need compression. For bz2-specific tests, we use
@@ -187,6 +477,10 @@ func TestProcessDumpStream(t *testing.T) {
 	}
 	defer writer.Close()
 
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
 		"P4947": "278",
@@ -205,7 +499,8 @@ func TestProcessDumpStream(t *testing.T) {
 	dumpData.WriteString("\n]\n")
 
 	seeder := NewSeeder(writer, nil, DumpFormatGZ)
-	imported, lines, err := seeder.processDumpStream(&dumpData, 0, nil)
+	dumpTime := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	imported, lines, err := seeder.processDumpStream(context.Background(), &dumpData, 0, nil, dumpTime)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
@@ -250,6 +545,10 @@ func TestProcessDumpStreamBZ2(t *testing.T) {
 	}
 	defer writer.Close()
 
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
 		"P4947": "278",
@@ -264,7 +563,8 @@ func TestProcessDumpStreamBZ2(t *testing.T) {
 	decompressed := bzip2.NewReader(bytes.NewReader(compressed))
 
 	seeder := NewSeeder(writer, nil, DumpFormatBZ2)
-	imported, _, err := seeder.processDumpStream(decompressed, 0, nil)
+	dumpTime := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	imported, _, err := seeder.processDumpStream(context.Background(), decompressed, 0, nil, dumpTime)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
@@ -281,6 +581,10 @@ func TestProcessDumpStreamGZ(t *testing.T) {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
 
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
@@ -300,7 +604,8 @@ func TestProcessDumpStreamGZ(t *testing.T) {
 	defer reader.Close()
 
 	seeder := NewSeeder(writer, nil, DumpFormatGZ)
-	imported, _, err := seeder.processDumpStream(reader, 0, nil)
+	dumpTime := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
+	imported, _, err := seeder.processDumpStream(context.Background(), reader, 0, nil, dumpTime)
 	if err != nil {
 		t.Fatalf("processDumpStream: %v", err)
 	}
@@ -317,6 +622,10 @@ func TestSeederSeedWithMockServer(t *testing.T) {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
 
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
@@ -341,7 +650,7 @@ func TestSeederSeedWithMockServer(t *testing.T) {
 	seeder := NewSeeder(writer, server.Client(), DumpFormatGZ)
 	seeder.dumpURL = server.URL
 
-	err = seeder.Seed()
+	err = seeder.Seed(context.Background())
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
@@ -394,6 +703,10 @@ func TestSeederNeedsSeed(t *testing.T) {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
 
 	seeder := NewSeeder(writer, nil, "")
 
@@ -466,6 +779,10 @@ func TestSeederSeedServerError(t *testing.T) {
 	}
 	defer writer.Close()
 
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		io.WriteString(w, "service unavailable")
@@ -475,7 +792,7 @@ func TestSeederSeedServerError(t *testing.T) {
 	seeder := NewSeeder(writer, server.Client(), DumpFormatBZ2)
 	seeder.dumpURL = server.URL
 
-	err = seeder.Seed()
+	err = seeder.Seed(context.Background())
 	if err == nil {
 		t.Fatal("expected error for server error response")
 	}
@@ -493,12 +810,23 @@ func TestSeederSeedSweepsStaleEntities(t *testing.T) {
 	}
 	defer writer.Close()
 
-	// Pre-populate a "stale" entity that won't appear in the dump
-	err = writer.UpsertEntity("Q999999", map[int][]string{
-		345: {"tt9999999"},
-	})
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
+	// Pre-populate a "stale" entity with an old Modified time
+	staleTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	err = writer.UpsertEntitiesBatch([]store.EntityRecord{{
+		WikidataID:  "Q999999",
+		ExternalIDs: map[int][]string{345: {"tt9999999"}},
+		Modified:    staleTime,
+	}})
 	if err != nil {
-		t.Fatalf("UpsertEntity stale: %v", err)
+		t.Fatalf("UpsertEntitiesBatch stale: %v", err)
 	}
 
 	// Build dump with only one entity
@@ -525,7 +853,7 @@ func TestSeederSeedSweepsStaleEntities(t *testing.T) {
 	seeder := NewSeeder(writer, server.Client(), DumpFormatGZ)
 	seeder.dumpURL = server.URL
 
-	err = seeder.Seed()
+	err = seeder.Seed(context.Background())
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
@@ -668,6 +996,10 @@ func TestSeederSeedResumesOnDrop(t *testing.T) {
 	}
 	defer writer.Close()
 
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
 	movie := buildDumpEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
 		"P4947": "278",
@@ -719,7 +1051,7 @@ func TestSeederSeedResumesOnDrop(t *testing.T) {
 	seeder := NewSeeder(writer, server.Client(), DumpFormatGZ)
 	seeder.dumpURL = server.URL
 
-	err = seeder.Seed()
+	err = seeder.Seed(context.Background())
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}

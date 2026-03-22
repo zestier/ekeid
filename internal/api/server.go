@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -79,6 +80,10 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.reader.LookupByProperty(property, value)
 	if err != nil {
+		if errors.Is(err, store.ErrSchemaMismatch) {
+			writeError(w, http.StatusServiceUnavailable, "unavailable", "Schema migration in progress")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal_error", "An internal error occurred")
 		return
 	}
@@ -122,6 +127,10 @@ func (s *Server) handleWikidataLookup(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.reader.LookupByWikidataID(wikidataID)
 	if err != nil {
+		if errors.Is(err, store.ErrSchemaMismatch) {
+			writeError(w, http.StatusServiceUnavailable, "unavailable", "Schema migration in progress")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal_error", "An internal error occurred")
 		return
 	}
@@ -158,6 +167,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Version:      s.version,
 		State:        info.State,
 		DatabaseSize: info.DatabaseSize,
+		SchemaMatch:  info.SchemaMatch,
 	}
 	if !info.DumpTime.IsZero() {
 		resp.DumpTime = info.DumpTime.Format("2006-01-02T15:04:05Z")
@@ -180,6 +190,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	resp := statsResponse{
 		State:        stats.State,
 		MappingCount: stats.MappingCount,
+		EntityCount:  stats.EntityCount,
 		PendingCount: stats.PendingCount,
 		FailedCount:  stats.FailedCount,
 		DatabaseSize: stats.DatabaseSize,
@@ -209,6 +220,7 @@ type healthResponse struct {
 	DumpTime      string `json:"dump_time,omitempty"`
 	LastEventSync string `json:"last_event_sync,omitempty"`
 	DatabaseSize  int64  `json:"database_size"`
+	SchemaMatch   bool   `json:"schema_match"`
 }
 
 type statsResponse struct {
@@ -216,6 +228,7 @@ type statsResponse struct {
 	DumpTime      string `json:"dump_time,omitempty"`
 	LastEventSync string `json:"last_event_sync,omitempty"`
 	MappingCount  int64  `json:"mapping_count"`
+	EntityCount   int64  `json:"entity_count"`
 	PendingCount  int64  `json:"pending_count"`
 	FailedCount   int64  `json:"failed_count"`
 	DatabaseSize  int64  `json:"database_size"`

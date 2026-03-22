@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -45,9 +46,10 @@ const (
 	dumpResumeMaxDelay      = 2 * time.Minute // maximum backoff delay
 	dumpResumeBackoffFactor = 2               // exponential backoff multiplier
 
-	// schemaVersion is hashed for configFingerprint. Bump when schema changes
-	// to trigger a reseed on next startup.
-	schemaVersion = "v2-property-based"
+	// seedVersion is hashed for configFingerprint. Bump when seed-time
+	// configuration changes (e.g. property filters) to trigger a reseed
+	// on next startup without dropping all tables.
+	seedVersion = "v2-property-based"
 )
 
 // countingReader wraps an io.Reader and counts the number of bytes read.
@@ -204,10 +206,10 @@ func (rb *resumableBody) Close() error {
 	return rb.body.Close()
 }
 
-// configFingerprint returns a stable hash of the schema version.
-// When the schema version changes, this hash changes, triggering a reseed.
+// configFingerprint returns a stable hash of the seed configuration.
+// When the seed version changes, this hash changes, triggering a reseed.
 func configFingerprint() string {
-	h := sha256.Sum256([]byte(schemaVersion))
+	h := sha256.Sum256([]byte(seedVersion))
 	return fmt.Sprintf("%x", h[:16])
 }
 
@@ -265,7 +267,7 @@ func (s *Seeder) NeedsSeed() (bool, error) {
 		return false, err
 	}
 	if storedHash != configFingerprint() {
-		log.Println("Schema version has changed, reseed required")
+		log.Println("Seed configuration has changed, reseed required")
 		return true, nil
 	}
 
@@ -273,7 +275,8 @@ func (s *Seeder) NeedsSeed() (bool, error) {
 }
 
 // Seed performs a bulk import by streaming the Wikidata JSON dump.
-func (s *Seeder) Seed() error {
+// It respects ctx cancellation so the process can shut down promptly.
+func (s *Seeder) Seed(ctx context.Context) error {
 	if err := s.writer.ClearSyncCursors(); err != nil {
 		return err
 	}
@@ -288,11 +291,7 @@ func (s *Seeder) Seed() error {
 
 	seedStart := time.Now()
 
-	if err := s.writer.StartSeedTracking(); err != nil {
-		return fmt.Errorf("start seed tracking: %w", err)
-	}
-
-	resp, err := s.openDumpStream()
+	resp, err := s.openDumpStream(ctx)
 	if err != nil {
 		return err
 	}
@@ -301,6 +300,12 @@ func (s *Seeder) Seed() error {
 	syncTime := parseDumpTime(resp.Header.Get("Last-Modified"))
 	log.Printf("Dump Last-Modified: %s → dump_time: %s",
 		resp.Header.Get("Last-Modified"), syncTime)
+
+	// Parse the dump time as a time.Time so we can use it for viewed_at.
+	dumpTimeT, err := time.Parse(time.RFC3339, syncTime)
+	if err != nil {
+		return fmt.Errorf("parse dump time %q: %w", syncTime, err)
+	}
 
 	counter := &countingReader{r: resp.Body}
 
@@ -326,11 +331,23 @@ func (s *Seeder) Seed() error {
 			defer closer.Close()
 		}
 		for {
+			select {
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			default:
+			}
 			bufp := chunkPool.Get().(*[]byte)
 			buf := (*bufp)[:dumpDecompChunkSize]
 			n, err := decompressed.Read(buf)
 			if n > 0 {
-				chunks <- buf[:n]
+				select {
+				case chunks <- buf[:n]:
+				case <-ctx.Done():
+					chunkPool.Put(bufp)
+					errCh <- ctx.Err()
+					return
+				}
 			} else {
 				chunkPool.Put(bufp)
 			}
@@ -344,23 +361,23 @@ func (s *Seeder) Seed() error {
 	}()
 
 	decompReader := &chanReader{ch: chunks, errCh: errCh, pool: chunkPool}
-	imported, lines, err := s.processDumpStream(decompReader, resp.ContentLength, counter)
+	imported, lines, err := s.processDumpStream(ctx, decompReader, resp.ContentLength, counter, dumpTimeT)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Sweeping stale mapping rows not present in dump...")
-	swept, err := s.writer.SweepUnseenEntities()
+	log.Printf("Sweeping stale entities not present in dump...")
+	swept, err := s.writer.SweepStaleEntities(dumpTimeT.Unix())
 	if err != nil {
 		return fmt.Errorf("sweep stale entities: %w", err)
 	}
-	log.Printf("Swept %d stale mapping rows not present in dump", swept)
+	log.Printf("Swept %d stale entities not present in dump", swept)
 
 	if err := s.writer.SetSyncState("dump_time", syncTime); err != nil {
 		return fmt.Errorf("set dump_time: %w", err)
 	}
 
-	log.Printf("Dump seed complete: %d entities imported, %d stale mappings swept from %d lines in %s",
+	log.Printf("Dump seed complete: %d entities imported, %d stale entities swept from %d lines in %s",
 		imported, swept, lines, time.Since(seedStart).Truncate(time.Second))
 	return nil
 }
@@ -376,8 +393,8 @@ func parseDumpTime(lastModified string) string {
 	return time.Now().UTC().Format(time.RFC3339)
 }
 
-func (s *Seeder) openDumpStream() (*http.Response, error) {
-	req, err := newRequest("GET", s.dumpURL)
+func (s *Seeder) openDumpStream(ctx context.Context) (*http.Response, error) {
+	req, err := newRequestWithContext(ctx, "GET", s.dumpURL)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -409,7 +426,7 @@ func (s *Seeder) openDumpStream() (*http.Response, error) {
 // processDumpStream reads decompressed JSON lines from r and upserts
 // relevant entities. It uses a background goroutine to write to the DB
 // while parsing continues, overlapping I/O with CPU work.
-func (s *Seeder) processDumpStream(r io.Reader, totalCompressed int64, counter *countingReader) (int, int, error) {
+func (s *Seeder) processDumpStream(ctx context.Context, r io.Reader, totalCompressed int64, counter *countingReader, dumpTime time.Time) (int, int, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, dumpScannerBufSize), dumpScannerBufSize)
 
@@ -432,7 +449,7 @@ func (s *Seeder) processDumpStream(r io.Reader, totalCompressed int64, counter *
 			if len(batch) == 0 {
 				return nil
 			}
-			if err := s.writer.UpsertEntitiesBatch(batch); err != nil {
+			if err := s.writer.SeedEntitiesBatch(dumpTime, batch); err != nil {
 				return err
 			}
 			batch = batch[:0]
@@ -458,6 +475,13 @@ func (s *Seeder) processDumpStream(r io.Reader, totalCompressed int64, counter *
 	imported := 0
 
 	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			close(entityCh)
+			wg.Wait()
+			return imported, lines, ctx.Err()
+		default:
+		}
 		line := scanner.Bytes()
 		lines++
 
@@ -480,10 +504,10 @@ func (s *Seeder) processDumpStream(r io.Reader, totalCompressed int64, counter *
 			continue
 		}
 
-		// Convert QID string to int64 for storage
 		entityCh <- store.EntityRecord{
 			WikidataID:  entity.ID,
 			ExternalIDs: entity.ExternalIDs,
+			Modified:    entity.Modified,
 		}
 		imported++
 

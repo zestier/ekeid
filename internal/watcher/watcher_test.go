@@ -274,6 +274,141 @@ func TestParseEntityJSON_InvalidJSON(t *testing.T) {
 	}
 }
 
+// buildTestEntityJSONWithModified constructs a Wikidata API-format entity JSON
+// with a custom modified field (simulating wbgetentities with props=claims|info).
+func buildTestEntityJSONWithModified(qid string, properties map[string]string, modified string) []byte {
+	claims := make(map[string]interface{})
+	for propID, value := range properties {
+		claims[propID] = []map[string]interface{}{
+			{
+				"mainsnak": map[string]interface{}{
+					"datatype": "external-id",
+					"datavalue": map[string]interface{}{
+						"value": value,
+						"type":  "string",
+					},
+				},
+			},
+		}
+	}
+
+	entityFields := map[string]interface{}{
+		"labels": map[string]interface{}{
+			"en": map[string]string{"value": "Test"},
+		},
+		"claims": claims,
+	}
+	if modified != "" {
+		entityFields["modified"] = modified
+	}
+
+	entity := map[string]interface{}{
+		"entities": map[string]interface{}{
+			qid: entityFields,
+		},
+	}
+
+	data, _ := json.Marshal(entity)
+	return data
+}
+
+// TestParseEntityJSON_ExtractsModified verifies the modified field from
+// the wbgetentities API response (requires props=info).
+func TestParseEntityJSON_ExtractsModified(t *testing.T) {
+	data := buildTestEntityJSONWithModified("Q1", map[string]string{"P345": "tt1"}, "2026-05-15T14:30:00Z")
+
+	entity, err := ParseEntityJSON("Q1", data)
+	if err != nil {
+		t.Fatalf("ParseEntityJSON: %v", err)
+	}
+	if entity == nil {
+		t.Fatal("expected non-nil entity")
+	}
+	expected := time.Date(2026, 5, 15, 14, 30, 0, 0, time.UTC)
+	if !entity.Modified.Equal(expected) {
+		t.Errorf("Modified = %v, want %v", entity.Modified, expected)
+	}
+}
+
+// TestParseEntityJSON_MissingModified verifies zero time when no modified field.
+func TestParseEntityJSON_MissingModified(t *testing.T) {
+	// buildTestEntityJSON does not include modified
+	data := buildTestEntityJSON("Q1", "Test", map[string]string{"P345": "tt1"})
+
+	entity, err := ParseEntityJSON("Q1", data)
+	if err != nil {
+		t.Fatalf("ParseEntityJSON: %v", err)
+	}
+	if entity == nil {
+		t.Fatal("expected non-nil entity")
+	}
+	if !entity.Modified.IsZero() {
+		t.Errorf("Modified = %v, want zero time (no modified field)", entity.Modified)
+	}
+}
+
+// TestProcessorPropagatesModified verifies that ProcessEntities propagates
+// the modified timestamp from the API response to the entity record.
+func TestProcessorPropagatesModified(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	writer, err := store.NewWriter(dbPath)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
+
+	modified := "2026-05-20T10:00:00Z"
+	entityJSON := buildTestEntityJSONWithModified("Q42", map[string]string{"P345": "nm0010930"}, modified)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(entityJSON)
+	}))
+	defer server.Close()
+
+	client := NewWikidataClient(server.Client())
+	client.baseURL = server.URL
+
+	processor := NewProcessor(writer, client)
+	err = processor.ProcessEntity("Q42")
+	if err != nil {
+		t.Fatalf("ProcessEntity: %v", err)
+	}
+
+	// The entity should survive a sweep at a time before the modified time
+	// (because viewed_at was set from Modified via UpsertEntitiesBatch)
+	reader := store.NewReaderFromDB(writer.DB())
+	result, err := reader.LookupByProperty(345, "nm0010930")
+	if err != nil {
+		t.Fatalf("LookupByProperty: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected entity to be stored")
+	}
+}
+
+// TestParseEntityJSON_UnparseableModified verifies that an invalid modified
+// date is silently treated as zero time, not an error.
+func TestParseEntityJSON_UnparseableModified(t *testing.T) {
+	data := buildTestEntityJSONWithModified("Q1", map[string]string{"P345": "tt1"}, "garbage-date")
+
+	entity, err := ParseEntityJSON("Q1", data)
+	if err != nil {
+		t.Fatalf("ParseEntityJSON should not error on bad modified: %v", err)
+	}
+	if entity == nil {
+		t.Fatal("expected non-nil entity")
+	}
+	if !entity.Modified.IsZero() {
+		t.Errorf("Modified = %v, want zero time for unparseable date", entity.Modified)
+	}
+}
+
 func TestProcessorWithMockServer(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
@@ -282,6 +417,10 @@ func TestProcessorWithMockServer(t *testing.T) {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
 
 	entityJSON := buildTestEntityJSON("Q172241", "The Shawshank Redemption", map[string]string{
 		"P345":  "tt0111161",
@@ -335,6 +474,10 @@ func TestConnectAndProcess_StreamGapTriggersReseed(t *testing.T) {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
 
 	// Set last_sync to 30 days ago so the stream can't possibly go back that far.
 	oldDumpTime := time.Now().Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339)
@@ -390,6 +533,10 @@ func TestConnectAndProcess_NoGapWhenStreamIsFresh(t *testing.T) {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	defer writer.Close()
+
+	if err := writer.MigrateSchema(); err != nil {
+		t.Fatalf("MigrateSchema: %v", err)
+	}
 
 	// Set dump_time so that after subtracting the 72h safety offset, sinceTime
 	// lands close to now — well within the 1h stream-gap threshold.
