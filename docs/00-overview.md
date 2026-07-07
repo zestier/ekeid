@@ -39,6 +39,12 @@ coordinate key -> remap entity -> asserted coordinates on that entity
                          -> derived coordinates from applicable scoped rules
 ```
 
+Implementation should optimize this as a lookup projection, not as live domain
+reasoning. Asserted coordinate memberships are finite and should be materialized
+for fast lookup. Derived coordinates are computed facts and should be supported
+through derivation scope and exception indexes; v1 must not require fully
+hydrating every possible derived coordinate into storage.
+
 Entities are operational resolution nodes. They are not public claims that all
 attached coordinates identify the exact same ontological thing. In messy media
 data, some upstream IDs may mean exact recordings, others may mean loose

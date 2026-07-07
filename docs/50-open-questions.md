@@ -105,12 +105,28 @@ Question: should derived coordinates be evaluated on demand, cached, or
 materialized into lookup rows?
 
 Current position: derived coordinates are semantic computed facts. Full
-hydration is not required. Implementations may cache or materialize for
-performance if invalidation is correct.
+hydration is not required and must not be a correctness requirement. The intended
+read model materializes asserted lookup sets plus compact derivation binding and
+exception indexes. Implementations may add exact-response caches or materialized
+derived rows for hot paths if invalidation/versioning is correct.
 
 Why it matters: fully hydrating common TV episode derivations could waste space
 and make exception updates expensive, but pure on-demand evaluation may need
 careful indexing.
+
+## Lookup projection backend
+
+Question: should the lookup projection live only in PostgreSQL, or eventually in
+an embedded/read-optimized KV store?
+
+Current position: start with PostgreSQL as the authoritative store and likely
+initial lookup projection. Keep the projection shape simple enough that it could
+later be exported to a read-optimized store such as RocksDB, LMDB, or SQLite
+without changing public API semantics.
+
+Why it matters: the service's performance target is closer to key-value lookup
+than relational graph traversal, but adding a second storage engine before
+PostgreSQL is proven insufficient would complicate operations.
 
 ## Ordering
 

@@ -161,7 +161,10 @@ supported by another source.
 
 ## Lookup index
 
-The hot lookup path should be equivalent to:
+The hot lookup path should be implemented as a read-optimized projection rather
+than live relational reasoning.
+
+At the logical level, lookup should be equivalent to:
 
 ```text
 decoded coordinate key -> entity id -> asserted coordinates owned by entity
@@ -175,6 +178,59 @@ It must not require:
 - checking arity;
 - running validation patterns;
 - computing source provenance.
+
+## Read model strategy
+
+The authoritative model and the lookup model are separate concerns.
+
+The authoritative model stores entities, asserted coordinates, source
+contributions, derivation rules, scope bindings, and exceptions. It is optimized
+for correctness, replacement, repair, and transactional updates.
+
+The lookup read model is optimized for request latency. It should include:
+
+- an asserted lookup projection:
+
+  ```text
+  coordinate_key -> entity_id or encoded asserted result set
+  entity_id -> encoded asserted coordinate set
+  ```
+
+- a derivation binding index:
+
+  ```text
+  input_definition_id + fixed input prefix -> derivation bindings
+  output_definition_id + fixed output prefix -> inverse derivation bindings
+  ```
+
+- an exception index:
+
+  ```text
+  rule/binding + derived coordinate key or prefix -> blocked
+  ```
+
+- optionally, an exact-response cache:
+
+  ```text
+  coordinate_key -> final encoded response
+  ```
+
+The asserted projection should be materialized because asserted coordinates are
+finite known records. The derivation binding and exception indexes should be
+materialized because they are compact and make derivation lookup bounded.
+
+The full set of derived child coordinates should not be required to be
+materialized. For example, a scoped rule from one TV series to another should not
+require prewriting every possible episode coordinate. Lookup can instead match
+the series prefix in the derivation binding index, copy the remaining path parts
+through the declarative template, check exceptions, and produce the derived
+coordinate on demand.
+
+Exact-response caching is an optimization only. It may be useful for hot
+coordinates, but correctness must come from the asserted projection plus
+derivation and exception indexes. Cache entries must be invalidated or versioned
+when the asserted projection, derivation rules, scope bindings, or exceptions
+change.
 
 Lookup must consider both asserted and derived coordinates:
 

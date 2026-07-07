@@ -10,5 +10,6 @@ Read in order:
 3. [Public API](20-public-api.md)
 4. [Internal admin and ingestion API](30-admin-ingestion.md)
 5. [Storage model](40-storage-model.md)
-6. [Open questions](50-open-questions.md)
-7. [Implementation plan](99-implementation-plan.md)
+6. [Technology and serving architecture](60-technology.md)
+7. [Open questions](50-open-questions.md)
+8. [Implementation plan](99-implementation-plan.md)

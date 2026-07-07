@@ -14,6 +14,10 @@ closed.
 - [ ] Define physical schema for derivation rules, scope bindings, exceptions,
       and derivation source contributions.
 - [ ] Implement derivation template validation without arbitrary code execution.
+- [ ] Define the asserted lookup projection separately from authoritative
+      coordinate membership storage.
+- [ ] Define derivation binding and exception indexes that support bounded
+      on-demand derivation without fully hydrating derived coordinates.
 
 ## Phase 2: Public read API
 
@@ -26,6 +30,10 @@ closed.
 - [ ] Ensure derived-only coordinates are addressable by lookup when an inverse
       or reverse binding is defined.
 - [ ] Suppress derived coordinates blocked by derivation exceptions.
+- [ ] Ensure lookup correctness does not depend on precomputed rows for every
+      possible derived coordinate.
+- [ ] Add optional exact-response caching only behind versioned or invalidatable
+      projection state.
 - [ ] Implement `GET /v1/coordinates`.
 - [ ] Implement `GET /v1/coordinates/{id}`.
 - [ ] Implement `GET /healthz`.
